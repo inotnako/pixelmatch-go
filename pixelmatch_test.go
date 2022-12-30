@@ -1,56 +1,60 @@
 package pixelmatch
 
 import (
+	"bytes"
 	"image"
 	"image/png"
 	"os"
 	"testing"
 )
 
-func TestMatch(t *testing.T) {
-	fileA, err := os.Open("./testdata/img1.png")
+func TestDiff(t *testing.T) {
+	//water-4k
+	//"./testdata/water-4k.png"
+	fileABytes, err := os.ReadFile("./testdata/water-4k.png")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fileA.Close()
+	lenA := len(fileABytes)
 
-	fileB, err := os.Open("./testdata/img2.png")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fileB.Close()
-
-	imgA, _, err := image.Decode(fileA)
+	fileBBytes, err := os.ReadFile("./testdata/water-4k-2.png")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	imgB, _, err := image.Decode(fileB)
+	imgA, _, err := image.Decode(bytes.NewBuffer(fileABytes))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	output := image.NewRGBA(image.Rect(0, 0, imgA.Bounds().Max.X, imgA.Bounds().Max.Y))
+	imgB, _, err := image.Decode(bytes.NewBuffer(fileBBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	diffCount, err := Match(imgA, imgB, output)
+	fileABytes = fileABytes[:0]
+	fileBBytes = fileBBytes[:0]
+	output := image.NewNRGBA(imgA.Bounds())
+
+	diffCount, err := Diff(imgA, imgB, output)
 	if err != nil {
 		t.Error("Unexpected error:", err)
 	}
-	if diffCount != 146355 {
+	t.Log("diffCount", diffCount)
+	if diffCount > 146355 {
 		t.Errorf("Expected 146355, got - %d", diffCount)
 	}
 
-	f, err := os.Create("./testdata/output.png")
-	if err != nil {
+	buff := bytes.NewBuffer(make([]byte, 0, lenA))
+
+	enc := png.Encoder{
+		CompressionLevel: png.BestSpeed,
+	}
+	if err := enc.Encode(buff, output); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := png.Encode(f, output); err != nil {
-		f.Close()
-		t.Fatal(err)
-	}
-
-	if err := f.Close(); err != nil {
+	if err := os.WriteFile("./testdata/output.png", buff.Bytes(), os.ModePerm); err != nil {
 		t.Fatal(err)
 	}
 }

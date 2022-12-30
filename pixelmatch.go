@@ -7,6 +7,9 @@ import (
 	"image/color"
 	"math"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type Options struct {
@@ -20,10 +23,10 @@ type Options struct {
 	alpha float32
 
 	// color of anti-aliased pixels in diff output
-	aaColor color.Color
+	aaColor color.NRGBA
 
 	// color of different pixels in diff output
-	diffColor color.Color
+	diffColor color.NRGBA
 
 	// whether to detect dark on light differences between img1 and img2
 	//  and set an alternative color to differentiate between the two
@@ -35,16 +38,17 @@ type Options struct {
 
 var defaultOptions = Options{
 	threshold: 0.1,
-	includeAA: false,
+	includeAA: true,
 	alpha:     0.1,
-	aaColor: &color.RGBA{
+
+	aaColor: color.NRGBA{
 		R: 255,
 		G: 255,
 		B: 0,
 		A: 255,
 	},
 
-	diffColor: &color.RGBA{
+	diffColor: color.NRGBA{
 		R: 255,
 		G: 0,
 		B: 0,
@@ -52,7 +56,7 @@ var defaultOptions = Options{
 	},
 
 	diffColorAlt: nil,
-	diffMask:     false,
+	diffMask:     true,
 }
 
 func isEmptyImg(img image.Image) bool {
@@ -119,15 +123,21 @@ func checkImages(imgs ...image.Image) error {
 	return nil
 }
 
-func Match(img1, img2 image.Image, output *image.RGBA) (uint64, error) {
+func Diff(img1, img2 image.Image, output *image.NRGBA) (uint64, error) {
 
 	if err := checkImages([]image.Image{img1, img2, output}...); err != nil {
 		return 0, err
 	}
 
-	//TODO: added here fast checking if the same images
+	println("image size", img1.Bounds().String())
 
 	options := defaultOptions
+
+	//img1At := imageutil.NewAtFunc(img1)
+	//img2At := imageutil.NewAtFunc(img2)
+
+	img1Obj, _ := img1.(*image.NRGBA)
+	img2Obj, _ := img2.(*image.NRGBA)
 
 	// maximum acceptable square distance between two colors;
 	// 35215 is the maximum possible value for the YIQ difference metric
@@ -136,89 +146,134 @@ func Match(img1, img2 image.Image, output *image.RGBA) (uint64, error) {
 		diff uint64 = 0
 		h           = output.Bounds().Max.Y
 		w           = output.Bounds().Max.X
+		wg          = sync.WaitGroup{}
 	)
 
-	// compare each pixel of one image against the other one
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			pos := image.Pt(x, y)
+	processSubImage := func(a, b *image.NRGBA, rectangle image.Rectangle) {
+		println("start process", rectangle.String())
+		tn := time.Now()
+		defer func() {
+			wg.Done()
+			println("end process", rectangle.String(), time.Since(tn).String())
+		}()
+		var (
+			cc1, cc2 [4]uint8
+		)
+		containerDiff := uint64(0)
+		// compare each pixel of one image against the other one
+		for y := rectangle.Min.Y; y < rectangle.Max.Y; y++ {
+			for x := rectangle.Min.X; x < rectangle.Max.X; x++ {
+				cc1 = getColor(a, x, y)
+				cc2 = getColor(b, x, y)
 
-			// squared YUV distance between colors at this pixel position, negative if the img2 pixel is darker
-			delta := colorDelta(img1, img2, pos, pos, false)
+				// squared YUV distance between colors at this pixel position, negative if the img2 pixel is darker
+				delta := colorDelta(cc1, cc2, false)
 
-			// the color difference is above the threshold
-			if math.Abs(delta) > maxDelta {
-				// check it's a real rendering difference or just anti-aliasing
-				if !options.includeAA && (antialiased(img1, img2, x, y, w, h) || antialiased(img2, img1, x, y, w, h)) {
-					// one of the pixels is anti-aliasing; draw as yellow and do not count as difference
-					// note that we do not include such pixels in a mask
-					if !options.diffMask {
-						drawPixel(output, pos, options.aaColor)
+				// the color difference is above the threshold
+				if math.Abs(delta) > maxDelta {
+					// check it's a real rendering difference or just anti-aliasing
+					if !options.includeAA && (antialiased(a, b, x, y, w, h) || antialiased(a, b, x, y, w, h)) {
+						// one of the pixels is anti-aliasing; draw as yellow and do not count as difference
+						// note that we do not include such pixels in a mask
+						if !options.diffMask {
+							output.SetNRGBA(x, y, options.aaColor)
+						}
+
+					} else {
+						// found substantial difference not caused by anti-aliasing; draw it as such
+						output.SetNRGBA(x, y, options.diffColor)
+						containerDiff++
 					}
 
-				} else {
-					// found substantial difference not caused by anti-aliasing; draw it as such
-					// ...(delta < 0 && options.diffColorAlt ||
-					drawPixel(output, pos, options.diffColor)
-					diff++
-				}
-
-			} else if output != nil {
-				// pixels are similar; draw background as grayscale image blended with white
-				if !options.diffMask {
-					drawGrayPixel(img1, pos, options.alpha, output)
+				} else if !options.diffMask {
+					// pixels are similar; draw background as grayscale image blended with white
+					output.SetNRGBA(x, y, grayColor(cc1, options.alpha))
 				}
 			}
 		}
+		atomic.AddUint64(&diff, containerDiff)
 	}
+
+	//cpus := runtime.NumCPU()
+	containerW := 2000
+	containerH := 2000
+	if containerH > h {
+		containerH = h - 1
+	}
+	if containerW > w {
+		containerW = w - 1
+	}
+
+	/*
+				((0,0),(100,100)) | ((100,0),(200,100)) | ((200,0),(300,100)) ....
+				((0,0),(100,100)) | ((100,0),(200,100)) | ((200,0),(300,100)) ....
+		        ....
+	*/
+
+	for x0 := 0; x0 < w-containerW; x0 += containerW {
+		for y0 := 0; y0 < h-containerH; y0 += containerH {
+			wg.Add(1)
+			x1 := x0 + containerW
+			y1 := y0 + containerW
+
+			if x1+containerW > w {
+				x1 = w
+			}
+			if y1+containerH > h {
+				y1 = h
+			}
+			rect := image.Rect(x0, y0, x1, y1)
+
+			go processSubImage(
+				img1Obj.SubImage(rect).(*image.NRGBA),
+				img2Obj.SubImage(rect).(*image.NRGBA),
+				rect,
+			)
+		}
+	}
+
+	wg.Wait()
 
 	return diff, nil
 }
 
-func drawPixel(img *image.RGBA, pos image.Point, c color.Color) {
-	img.Set(pos.X, pos.Y, c)
-}
-
-func drawGrayPixel(img image.Image, pos image.Point, alpha float32, out *image.RGBA) {
-	r, g, b, a := img.At(pos.X, pos.Y).RGBA()
-	val := blend(uint32(rgb2y(r, g, b)), uint32((alpha*float32(a))/255))
-	drawPixel(out, pos, &color.RGBA{
-		R: uint8(val),
-		G: uint8(val),
-		B: uint8(val),
+func grayColor(c [4]uint8, alpha float32) color.NRGBA {
+	val := blend(
+		uint8(rgb2y(c[0], c[1], c[2])),
+		uint8((alpha*float32(c[3]))/255),
+	)
+	return color.NRGBA{
+		R: val,
+		G: val,
+		B: val,
 		A: 255,
-	})
+	}
 }
 
 // calculate color difference according to the paper "Measuring perceived color difference
 // using YIQ NTSC transmission color space in mobile applications" by Y. Kotsarenko and F. Ramos
-func colorDelta(img1, img2 image.Image, k, m image.Point, yOnly bool) float64 {
-	var (
-		r1, g1, b1, a1 = img1.At(k.X, k.Y).RGBA()
-		r2, g2, b2, a2 = img2.At(m.X, m.Y).RGBA()
-	)
-
-	if a1 == a2 && r1 == r2 && g1 == g2 && b1 == b2 {
+func colorDelta(c1, c2 [4]uint8, yOnly bool) float64 {
+	if colorEq(c1, c2) {
 		return 0
 	}
 
-	if a1 < 255 {
-		a1 /= 255
-		r1 = blend(r1, a1)
-		g1 = blend(g1, a1)
-		b1 = blend(b1, a1)
+	if c1[3] < 255 {
+		c1[3] /= 255
+		c1[0] = blend(c1[0], c1[3])
+		c1[1] = blend(c1[1], c1[3])
+		c1[2] = blend(c1[2], c1[3])
 	}
 
-	if a2 < 255 {
-		a2 /= 255
-		r2 = blend(r2, a2)
-		g2 = blend(g2, a2)
-		b2 = blend(b2, a2)
+	if c2[3] < 255 {
+		c2[3] /= 255
+		c2[0] = blend(c2[0], c2[3])
+		c2[1] = blend(c2[1], c2[3])
+		c2[2] = blend(c2[2], c2[3])
 	}
 
 	var (
-		y1 = rgb2y(r1, g1, b1)
-		y2 = rgb2y(r2, g2, b2)
+		y1 = rgb2y(c1[0], c1[1], c1[2])
+		y2 = rgb2y(c2[0], c2[1], c2[2])
 		y  = y1 - y2
 	)
 
@@ -228,8 +283,8 @@ func colorDelta(img1, img2 image.Image, k, m image.Point, yOnly bool) float64 {
 	}
 
 	var (
-		i = rgb2i(r1, g1, b1) - rgb2i(r2, g2, b2)
-		q = rgb2q(r1, g1, b1) - rgb2q(r2, g2, b2)
+		i = rgb2i(c1[0], c1[1], c1[2]) - rgb2i(c2[0], c2[1], c2[2])
+		q = rgb2q(c1[0], c1[1], c1[2]) - rgb2q(c2[0], c2[1], c2[2])
 	)
 
 	delta := 0.5053*y*y + 0.299*i*i + 0.1957*q*q
@@ -242,24 +297,24 @@ func colorDelta(img1, img2 image.Image, k, m image.Point, yOnly bool) float64 {
 	return delta
 }
 
-func rgb2y(r, g, b uint32) float64 {
+func rgb2y(r, g, b uint8) float64 {
 	return float64(r)*0.29889531 + float64(g)*0.58662247 + float64(b)*0.11448223
 }
-func rgb2i(r, g, b uint32) float64 {
+func rgb2i(r, g, b uint8) float64 {
 	return float64(r)*0.59597799 - float64(g)*0.27417610 - float64(b)*0.32180189
 }
-func rgb2q(r, g, b uint32) float64 {
+func rgb2q(r, g, b uint8) float64 {
 	return float64(r)*0.21147017 - float64(g)*0.52261711 + float64(b)*0.31114694
 }
 
 // blend semi-transparent color with white
-func blend(c, a uint32) uint32 {
+func blend(c, a uint8) uint8 {
 	return 255 + (c-255)*a
 }
 
 // check if a pixel is likely a part of anti-aliasing;
 // based on "Anti-aliased Pixel and Intensity Slope Detector" paper by V. Vysniauskas, 2009
-func antialiased(img, img2 image.Image, x1, y1, width, height int) bool {
+func antialiased(a, b *image.NRGBA, x1, y1, width, height int) bool {
 	var (
 		x0                             = int(math.Max(float64(x1-1), 0))
 		y0                             = int(math.Max(float64(y1-1), float64(0)))
@@ -283,7 +338,7 @@ func antialiased(img, img2 image.Image, x1, y1, width, height int) bool {
 			}
 
 			// brightness delta between the center pixel and adjacent one
-			delta := colorDelta(img, img, image.Pt(x1, y1), image.Pt(x, y), true)
+			delta := colorDelta(getColor(a, x1, y1), getColor(b, x, y), true)
 
 			// count the number of equal, darker and brighter adjacent pixels
 			if delta == 0 {
@@ -315,20 +370,34 @@ func antialiased(img, img2 image.Image, x1, y1, width, height int) bool {
 
 	// if either the darkest or the brightest pixel has 3+ equal siblings in both images
 	// (definitely not anti-aliased), this pixel is anti-aliased
-	return (hasManySiblings(img, minX, minY, width, height) && hasManySiblings(img2, minX, minY, width, height)) ||
-		(hasManySiblings(img, maxX, maxY, width, height) && hasManySiblings(img2, maxX, maxY, width, height))
+	return (hasManySiblings(a, minX, minY, width, height) && hasManySiblings(b, minX, minY, width, height)) ||
+		(hasManySiblings(a, maxX, maxY, width, height) && hasManySiblings(b, maxX, maxY, width, height))
 }
 
-func colorEq(c1, c2 color.Color) bool {
-	var (
-		r1, g1, b1, a1 = c1.RGBA()
-		r2, g2, b2, a2 = c2.RGBA()
-	)
-	return r1 == r2 && g1 == g2 && b1 == b2 && a1 == a2
+func toUint8(r, g, b, a uint32) (uint8, uint8, uint8, uint8) {
+	return uint8(r), uint8(g), uint8(b), uint8(a)
+}
+
+var (
+	countCall uint64
+)
+
+func getColor(img *image.NRGBA, x, y int) (c [4]uint8) {
+	countCall++
+
+	i := img.PixOffset(x, y)
+	copy(c[:], img.Pix[i:i+4:i+4])
+
+	return
+}
+
+func colorEq(c1, c2 [4]uint8) bool {
+	return c1 == c2
+	//return c1[0] == c2[0] && c1[1] == c2[1] && c1[2] == c2[2] && c1[3] == c2[3]
 }
 
 // check if a pixel has 3+ adjacent pixels of the same color.
-func hasManySiblings(img image.Image, x1, y1, width, height int) bool {
+func hasManySiblings(a *image.NRGBA, x1, y1, width, height int) bool {
 	var (
 		x0     = int(math.Max(float64(x1-1), 0))
 		y0     = int(math.Max(float64(y1-1), float64(0)))
@@ -348,14 +417,13 @@ func hasManySiblings(img image.Image, x1, y1, width, height int) bool {
 				continue
 			}
 
-			if colorEq(img.At(x1, y1), img.At(x, y)) {
+			if colorEq(getColor(a, x1, y1), getColor(a, x, y)) {
 				zeroes++
 			}
 
 			if zeroes > 2 {
 				return true
 			}
-
 		}
 	}
 
