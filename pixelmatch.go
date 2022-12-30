@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 type Options struct {
@@ -129,12 +128,7 @@ func Diff(img1, img2 image.Image, output *image.NRGBA) (uint64, error) {
 		return 0, err
 	}
 
-	println("image size", img1.Bounds().String())
-
 	options := defaultOptions
-
-	//img1At := imageutil.NewAtFunc(img1)
-	//img2At := imageutil.NewAtFunc(img2)
 
 	img1Obj, _ := img1.(*image.NRGBA)
 	img2Obj, _ := img2.(*image.NRGBA)
@@ -150,12 +144,8 @@ func Diff(img1, img2 image.Image, output *image.NRGBA) (uint64, error) {
 	)
 
 	processSubImage := func(a, b *image.NRGBA, rectangle image.Rectangle) {
-		println("start process", rectangle.String())
-		tn := time.Now()
-		defer func() {
-			wg.Done()
-			println("end process", rectangle.String(), time.Since(tn).String())
-		}()
+		defer wg.Done()
+
 		var (
 			cc1, cc2 [4]uint8
 		)
@@ -194,7 +184,6 @@ func Diff(img1, img2 image.Image, output *image.NRGBA) (uint64, error) {
 		atomic.AddUint64(&diff, containerDiff)
 	}
 
-	//cpus := runtime.NumCPU()
 	containerW := 2000
 	containerH := 2000
 	if containerH > h {
@@ -374,17 +363,7 @@ func antialiased(a, b *image.NRGBA, x1, y1, width, height int) bool {
 		(hasManySiblings(a, maxX, maxY, width, height) && hasManySiblings(b, maxX, maxY, width, height))
 }
 
-func toUint8(r, g, b, a uint32) (uint8, uint8, uint8, uint8) {
-	return uint8(r), uint8(g), uint8(b), uint8(a)
-}
-
-var (
-	countCall uint64
-)
-
 func getColor(img *image.NRGBA, x, y int) (c [4]uint8) {
-	countCall++
-
 	i := img.PixOffset(x, y)
 	copy(c[:], img.Pix[i:i+4:i+4])
 

@@ -6,6 +6,7 @@ import (
 	"image/png"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestDiff(t *testing.T) {
@@ -36,7 +37,9 @@ func TestDiff(t *testing.T) {
 	fileBBytes = fileBBytes[:0]
 	output := image.NewNRGBA(imgA.Bounds())
 
+	ts := time.Now()
 	diffCount, err := Diff(imgA, imgB, output)
+	t.Log("diff latency", time.Since(ts).String())
 	if err != nil {
 		t.Error("Unexpected error:", err)
 	}
